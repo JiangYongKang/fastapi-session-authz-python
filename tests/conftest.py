@@ -58,10 +58,22 @@ def service(settings, roles) -> AuthService:
     return svc
 
 
-@pytest.fixture(autouse=True)
-def _verbose_logs(caplog):
-    """单测日志打印请求输入、判定依据与最终结论。"""
-    caplog.set_level(logging.INFO, logger="app.service")
-    yield
-    for record in caplog.records:
+class _AuditPrinter(logging.Handler):
+    """把审计日志即时打印到测试输出（请求输入、判定依据、最终结论）。"""
+
+    def emit(self, record: logging.LogRecord) -> None:
         print(f"[audit] {record.getMessage()}")
+
+
+@pytest.fixture(autouse=True)
+def _verbose_logs():
+    logger = logging.getLogger("app.service")
+    handler = _AuditPrinter()
+    old_level = logger.level
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
