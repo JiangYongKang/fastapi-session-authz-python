@@ -6,12 +6,17 @@ from dataclasses import dataclass, field
 
 
 class RejectReason(enum.Enum):
-    """凭证被拒绝的具体原因，三类必须可区分。"""
+    """凭证被拒绝的具体原因，各类必须可区分。
+
+    RATE_LIMITED 表示“因来源限流/锁定被拒”，此时凭证尚未被检查，
+    该原因本身不携带凭证是否有效的任何信息。
+    """
 
     EXPIRED = "expired"
     REVOKED = "revoked"
     REPLAYED = "replayed"
     UNKNOWN = "unknown"
+    RATE_LIMITED = "rate_limited"
 
 
 class SessionStatus(enum.Enum):
@@ -46,6 +51,17 @@ class IssuedToken:
 class RefreshResult:
     ok: bool
     token: IssuedToken | None = None
+    reason: RejectReason | None = None
+    # True 表示宽限窗口内的并发竞争重放（良性竞态），不计入来源风险；
+    # 窗口之外的事后重放（疑似被盗）与其他失败仍计入
+    racing: bool = False
+
+
+@dataclass(frozen=True)
+class LogoutResult:
+    """注销结论：ok=False 时 reason 区分 限流拒绝 与 凭证不可注销。"""
+
+    ok: bool
     reason: RejectReason | None = None
 
 

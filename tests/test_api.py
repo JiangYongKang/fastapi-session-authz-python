@@ -116,3 +116,51 @@ def test_lockout_boundary_over_http(svc):
         assert r.json() == {"detail": "invalid credentials"}
         audit("POST /login", "correct password during lock", "source locked",
               "401 generic")
+
+
+def test_locked_source_sensitive_ops_return_429(svc):
+    """锁定期间：/refresh 与 /logout 返回 429 rate_limited，且凭证状态不变。"""
+    with _client(svc) as c:
+        token = c.post(
+            "/login", json={"username": "alice", "password": "alice-secret"}
+        ).json()["token"]
+        for _ in range(3):
+            assert c.post(
+                "/login", json={"username": "alice", "password": "bad"}
+            ).status_code == 401
+        audit("POST /login x3", "same source, bad password",
+              "shared risk counter >= 3", "source locked")
+
+        r = c.post("/refresh", json={"token": token})
+        assert r.status_code == 429
+        assert r.json() == {"detail": "rate_limited"}
+        audit("POST /refresh", "valid token, locked source",
+              "admission=locked, credential not inspected", "429 rate_limited")
+
+        r2 = c.post("/logout", json={"token": token})
+        assert r2.status_code == 429
+        assert r2.json() == {"detail": "rate_limited"}
+        audit("POST /logout", "valid token, locked source",
+              "admission=locked, credential not inspected", "429 rate_limited")
+
+        # 凭证未被改动：锁定期间它没有被轮换也没有被撤销，
+        # 锁定期内受保护端点仍按其自身状态判定（凭证本身仍有效）
+        r3 = c.get("/protected/documents",
+                   headers={"Authorization": f"Bearer {token}"})
+        assert r3.status_code == 200
+        audit("GET /protected/documents", "token after rejected refresh/logout",
+              "status=active unchanged", "200 allowed")
+
+
+def test_logout_response_does_not_leak_token_validity(svc):
+    """注销接口对未知/有效凭证响应一致（204），不暴露凭证是否存在。"""
+    with _client(svc) as c:
+        token = c.post(
+            "/login", json={"username": "alice", "password": "alice-secret"}
+        ).json()["token"]
+        r_valid = c.post("/logout", json={"token": token})
+        r_unknown = c.post("/logout", json={"token": "made-up"})
+        assert r_valid.status_code == r_unknown.status_code == 204
+        assert r_valid.content == r_unknown.content
+        audit("POST /logout", "valid token vs unknown token",
+              "identical 204 empty body", "no validity oracle")

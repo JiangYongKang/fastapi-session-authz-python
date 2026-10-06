@@ -119,18 +119,21 @@ class SessionStore:
             if record.status == SessionStatus.ROTATED:
                 assert record.rotated_at is not None
                 if now - record.rotated_at <= self._settings.replay_grace_seconds:
-                    # 宽限窗口内：并发竞争的重复使用，拒绝并保留胜出的新链
+                    # 宽限窗口内：并发竞争的重复使用，拒绝并保留胜出的新链；
+                    # 标记 racing=True，调用方不将其计入来源风险
                     logger.warning(
                         "refresh rejected reason=replayed token_fp=%s mode=racing", fp
                     )
-                else:
-                    # 窗口之外：旧凭证事后被重放，疑似被盗，撤销整条链
-                    revoked = self._revoke_family_locked(record.family_id)
-                    logger.warning(
-                        "refresh rejected reason=replayed token_fp=%s "
-                        "mode=stolen family_revoked=%d",
-                        fp, revoked,
+                    return RefreshResult(
+                        ok=False, reason=RejectReason.REPLAYED, racing=True
                     )
+                # 窗口之外：旧凭证事后被重放，疑似被盗，撤销整条链
+                revoked = self._revoke_family_locked(record.family_id)
+                logger.warning(
+                    "refresh rejected reason=replayed token_fp=%s "
+                    "mode=stolen family_revoked=%d",
+                    fp, revoked,
+                )
                 return RefreshResult(ok=False, reason=RejectReason.REPLAYED)
             if record.expires_at <= now:
                 logger.warning("refresh rejected reason=expired token_fp=%s", fp)

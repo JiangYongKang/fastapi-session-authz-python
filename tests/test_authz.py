@@ -79,7 +79,7 @@ def test_role_definition_change_takes_effect_immediately(svc):
 def test_revocation_takes_effect_immediately(svc):
     token = svc.login("ip-e", "alice", "alice-secret", now=0.0)
     assert svc.authorize(token.plaintext, "documents:read", now=1.0).allowed
-    svc.logout(token.plaintext)
+    svc.logout("ip-e", token.plaintext, now=1.5)
     decision = svc.authorize(token.plaintext, "documents:read", now=2.0)
     audit("authorize", "after revoke", f"classify={RejectReason.REVOKED}",
           "denied:revoked")

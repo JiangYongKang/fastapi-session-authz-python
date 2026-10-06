@@ -16,6 +16,11 @@ def _settings_from_env() -> Settings:
         max_failed_attempts=int(os.getenv("MAX_FAILED_ATTEMPTS", "5")),
         lockout_seconds=float(os.getenv("LOCKOUT_SECONDS", "300")),
         replay_grace_seconds=float(os.getenv("REPLAY_GRACE_SECONDS", "1")),
+        lockout_multiplier=float(os.getenv("LOCKOUT_MULTIPLIER", "2")),
+        lockout_max_seconds=float(os.getenv("LOCKOUT_MAX_SECONDS", "3600")),
+        calm_seconds=float(os.getenv("CALM_SECONDS", "900")),
+        max_sources=int(os.getenv("MAX_SOURCES", "10000")),
+        source_idle_seconds=float(os.getenv("SOURCE_IDLE_SECONDS", "3600")),
     )
 
 

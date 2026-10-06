@@ -39,7 +39,11 @@ def test_success_resets_counter(svc, settings):
 
 
 def test_concurrent_failures_counted_exactly(svc):
-    """N 个并发失败请求必须恰好计入 N 次：不漏计、不重复计。"""
+    """N 个并发失败请求必须恰好计入 N 次：不漏计、不重复计。
+
+    锁定期间到达的失败如实计入但不延长当前锁定期；期满结算时，
+    累计失败仍达阈值则按升级后的时长开启新锁定。
+    """
     n = 20
     barrier = threading.Barrier(n)
     triggered: list[bool] = [False] * n
@@ -54,13 +58,21 @@ def test_concurrent_failures_counted_exactly(svc):
     for t in threads:
         t.join()
 
-    # 阈值 3：20 次失败应触发 6 次锁定（第 3、6、9、12、15、18 次），
-    # 第 19、20 次是新一轮计数
-    assert sum(triggered) == n // svc.settings.max_failed_attempts
+    # 阈值 3：前 3 次失败触发首次锁定（level 1，30s，至 31.0）；
+    # 其余 17 次发生在锁定期内：如实计入但不触发新锁定、不续期
+    assert sum(triggered) == 1
     audit("record_failure x20 concurrent", "barrier sync, same source",
-          "lock-serialized counter",
-          f"exact count=20, lockouts={sum(triggered)}")
+          "lock-serialized counter; locked_until never slides",
+          f"exact count=20, lockouts_now={sum(triggered)}")
+    until = svc.limiter.locked_until("ip-3")
+    assert until == 1.0 + svc.settings.lockout_seconds
     assert svc.limiter.is_locked("ip-3", now=1.5)
+    # 期满结算：锁定期间累计 17 次失败 >= 阈值 -> 立即按升级时长再锁
+    assert svc.limiter.is_locked("ip-3", now=31.1)
+    until2 = svc.limiter.locked_until("ip-3")
+    assert until2 == 31.1 + svc.settings.lockout_seconds * svc.settings.lockout_multiplier
+    audit("is_locked after expiry", "pending failures=17 >= 3",
+          "re-lock at escalated level=2", f"locked_until={until2}")
 
 
 def test_lockout_is_per_source(svc):
@@ -86,18 +98,19 @@ def test_login_failure_message_does_not_leak(svc, caplog):
 def test_rejected_refresh_reasons_are_distinct(svc):
     # expired
     t_exp = svc.sessions.issue("alice", frozenset(), now=0.0)
-    assert svc.refresh(t_exp.plaintext, now=999.0).reason == RejectReason.EXPIRED
+    assert svc.refresh("ip-r", t_exp.plaintext, now=999.0).reason == RejectReason.EXPIRED
     # revoked
     t_rev = svc.sessions.issue("alice", frozenset(), now=0.0)
-    svc.logout(t_rev.plaintext)
-    assert svc.refresh(t_rev.plaintext, now=1.0).reason == RejectReason.REVOKED
+    svc.logout("ip-r", t_rev.plaintext, now=0.5)
+    assert svc.refresh("ip-r", t_rev.plaintext, now=1.0).reason == RejectReason.REVOKED
     # replayed
     t_rp = svc.sessions.issue("alice", frozenset(), now=0.0)
-    svc.refresh(t_rp.plaintext, now=1.0)
-    assert svc.refresh(t_rp.plaintext, now=1.5).reason == RejectReason.REPLAYED
+    svc.refresh("ip-r", t_rp.plaintext, now=1.0)
+    assert svc.refresh("ip-r", t_rp.plaintext, now=1.5).reason == RejectReason.REPLAYED
+    # 第二轮验证用独立来源，避免共享计数达到阈值干扰原因判定
     reasons = {
-        svc.refresh(t_exp.plaintext, now=999.0).reason,
-        svc.refresh(t_rev.plaintext, now=1.0).reason,
-        svc.refresh(t_rp.plaintext, now=1.5).reason,
+        svc.refresh("ip-r2", t_exp.plaintext, now=999.0).reason,
+        svc.refresh("ip-r3", t_rev.plaintext, now=1.0).reason,
+        svc.refresh("ip-r4", t_rp.plaintext, now=1.5).reason,
     }
     assert reasons == {RejectReason.EXPIRED, RejectReason.REVOKED, RejectReason.REPLAYED}

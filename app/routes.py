@@ -37,9 +37,16 @@ def login(
 
 
 @router.post("/refresh")
-def refresh(body: TokenBody, svc: AuthService = Depends(get_service)):
-    result = svc.refresh(body.token, now())
+def refresh(
+    body: TokenBody,
+    request: Request,
+    svc: AuthService = Depends(get_service),
+):
+    result = svc.refresh(_source(request), body.token, now())
     if not result.ok or result.token is None:
+        if result.reason is not None and result.reason.value == "rate_limited":
+            # 限流/锁定拒绝：不暴露凭证是否有效
+            raise HTTPException(status_code=429, detail="rate_limited")
         # 拒绝原因可区分：expired / revoked / replayed / unknown
         raise HTTPException(status_code=401, detail=result.reason.value)
     return {
@@ -49,8 +56,15 @@ def refresh(body: TokenBody, svc: AuthService = Depends(get_service)):
 
 
 @router.post("/logout", status_code=204)
-def logout(body: TokenBody, svc: AuthService = Depends(get_service)):
-    svc.logout(body.token)
+def logout(
+    body: TokenBody,
+    request: Request,
+    svc: AuthService = Depends(get_service),
+):
+    result = svc.logout(_source(request), body.token, now())
+    if not result.ok and result.reason is not None and result.reason.value == "rate_limited":
+        raise HTTPException(status_code=429, detail="rate_limited")
+    # 其余情况一律 204：不暴露凭证是否存在/有效
     return None
 
 

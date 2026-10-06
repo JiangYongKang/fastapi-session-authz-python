@@ -1,4 +1,4 @@
-"""认证与授权服务：组合凭证存储、权限注册表与限流器，对外提供用例级接口。"""
+"""认证与授权服务：组合凭证存储、权限注册表与来源风险准入，对外提供用例级接口。"""
 from __future__ import annotations
 
 import hashlib
@@ -9,7 +9,13 @@ import threading
 
 from app.authz import RoleRegistry
 from app.config import Settings
-from app.models import AuthzDecision, IssuedToken, RefreshResult
+from app.models import (
+    AuthzDecision,
+    IssuedToken,
+    LogoutResult,
+    RefreshResult,
+    RejectReason,
+)
 from app.rate_limit import RateLimiter
 from app.session_store import SessionStore
 from app.tokens import fingerprint
@@ -88,7 +94,7 @@ class AuthService:
                 source, triggered,
             )
             return None
-        self.limiter.record_success(source)
+        self.limiter.record_success(source, now)
         roles = self._roles_of(username) or frozenset()
         token = self.sessions.issue(username, roles, now)
         logger.info(
@@ -97,11 +103,55 @@ class AuthService:
         )
         return token
 
-    def refresh(self, plaintext: str, now: float) -> RefreshResult:
-        return self.sessions.refresh(plaintext, now)
+    def refresh(self, source: str, plaintext: str, now: float) -> RefreshResult:
+        """凭证换发：先过来源风险准入，再执行轮换。
 
-    def logout(self, plaintext: str) -> bool:
-        return self.sessions.revoke(plaintext)
+        来源锁定期间直接拒绝（reason=rate_limited）：不检查凭证、
+        不产生新凭证、不改动任何现有凭证状态。拒绝原因与凭证类原因
+        （expired/revoked/replayed/unknown）可区分；被拒绝的换发与
+        被拒绝的登录共享同一份风险计数。
+        """
+        if self.limiter.is_locked(source, now):
+            logger.warning(
+                "refresh rejected reason=rate_limited source=%s token_fp=%s",
+                source, fingerprint(plaintext),
+            )
+            return RefreshResult(ok=False, reason=RejectReason.RATE_LIMITED)
+        result = self.sessions.refresh(plaintext, now)
+        if result.ok:
+            self.limiter.record_success(source, now)
+        elif not result.racing:
+            # 宽限窗口内的并发竞争重放是良性竞态，不计入风险；
+            # 其余失败（含事后重放）与登录失败共享同一计数
+            triggered = self.limiter.record_failure(source, now)
+            logger.warning(
+                "refresh risk counted source=%s reason=%s lockout=%s",
+                source, result.reason.value if result.reason else "unknown",
+                triggered,
+            )
+        return result
+
+    def logout(self, source: str, plaintext: str, now: float) -> LogoutResult:
+        """凭证注销：同样先过来源风险准入。
+
+        锁定期间拒绝注销（reason=rate_limited），凭证状态保持不变；
+        对不存在/已撤销的凭证注销计为一次风险失败（探测行为）。
+        """
+        if self.limiter.is_locked(source, now):
+            logger.warning(
+                "logout rejected reason=rate_limited source=%s token_fp=%s",
+                source, fingerprint(plaintext),
+            )
+            return LogoutResult(ok=False, reason=RejectReason.RATE_LIMITED)
+        if self.sessions.revoke(plaintext):
+            self.limiter.record_success(source, now)
+            return LogoutResult(ok=True)
+        triggered = self.limiter.record_failure(source, now)
+        logger.warning(
+            "logout risk counted source=%s reason=unknown lockout=%s",
+            source, triggered,
+        )
+        return LogoutResult(ok=False, reason=RejectReason.UNKNOWN)
 
     def authorize(self, plaintext: str, required: str, now: float) -> AuthzDecision:
         """权限判定：凭证无效或权限不足均拒绝，结论含命中依据。
