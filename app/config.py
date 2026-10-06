@@ -9,6 +9,13 @@ class Settings:
     session_ttl_seconds: float = 3600.0
     max_failed_attempts: int = 5
     lockout_seconds: float = 300.0
+    # 渐进式锁定：同一来源连续触发锁定时，时长按倍数递增直至上限
+    lockout_multiplier: float = 2.0
+    max_lockout_seconds: float = 3600.0
+    # 平稳期：距上次失败超过该时长后，锁定等级回到基础档重新计数
+    calm_seconds: float = 86400.0
+    # 风险状态表中最多保留的来源数量，闲置来源被确定性回收
+    max_tracked_sources: int = 10000
     token_bytes: int = 32
     # 轮换完成后该宽限窗口内的旧凭证重放视为并发竞争：拒绝但不吊销新链；
     # 窗口之外的重放视为凭证被盗，撤销整条轮换链

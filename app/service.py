@@ -1,4 +1,11 @@
-"""认证与授权服务：组合凭证存储、权限注册表与限流器，对外提供用例级接口。"""
+"""认证与授权服务：组合凭证存储、权限注册表与来源风险准入，对外提供用例级接口。
+
+敏感操作（登录 / 凭证换发 / 凭证注销）统一经过 ``RateLimiter.gate``：
+同一来源共享风险计数与锁定状态；锁定期内的敏感操作在触碰凭证之前就被
+拒绝（不产生新凭证、不改动现有凭证）。限流原因 ``rate_limited`` 与凭证
+原因（expired/revoked/replayed/unknown）对调用方可区分，但对外 HTTP
+响应与日志均不暴露凭证是否有效、用户是否存在。
+"""
 from __future__ import annotations
 
 import hashlib
@@ -6,10 +13,17 @@ import hmac
 import logging
 import secrets
 import threading
+import time
 
 from app.authz import RoleRegistry
 from app.config import Settings
-from app.models import AuthzDecision, IssuedToken, RefreshResult
+from app.models import (
+    AuthzDecision,
+    IssuedToken,
+    LogoutResult,
+    RefreshResult,
+    RejectReason,
+)
 from app.rate_limit import RateLimiter
 from app.session_store import SessionStore
 from app.tokens import fingerprint
@@ -68,40 +82,110 @@ class AuthService:
             entry = self._users.get(username)
             return entry[1] if entry else None
 
-    # ---- 用例 ----
+    # ---- 敏感操作用例（统一来源风险准入） ----
 
     def login(
         self, source: str, username: str, password: str, now: float
     ) -> IssuedToken | None:
-        """登录：限流检查 -> 校验口令 -> 签发会话。
+        """登录：来源准入 -> 校验口令 -> 签发会话。
 
-        锁定、口令错误、用户不存在对外表现一致（均返回 None），
-        日志只记录来源与指纹，绝不记录明文口令或凭证。
+        锁定、口令错误、用户不存在对外表现一致（均返回 None）；
+        准入区间与口令校验同来源串行。日志只记录来源与指纹，
+        绝不记录明文口令或凭证。
         """
-        if self.limiter.is_locked(source, now):
-            logger.warning("login rejected reason=locked source=%s", source)
-            return None
-        if not self._verify_password(username, password):
-            triggered = self.limiter.record_failure(source, now)
-            logger.warning(
-                "login rejected reason=bad_credentials source=%s lockout=%s",
-                source, triggered,
+        with self.limiter.gate(source, now) as held:
+            if not held.admitted:
+                logger.warning(
+                    "login rejected reason=rate_limited source=%s", source
+                )
+                return None
+            if not self._verify_password(username, password):
+                triggered = held.report_failure(now)
+                logger.warning(
+                    "login rejected reason=bad_credentials source=%s lockout=%s",
+                    source, triggered,
+                )
+                return None
+            held.report_success()
+            roles = self._roles_of(username) or frozenset()
+            token = self.sessions.issue(username, roles, now)
+            logger.info(
+                "login ok subject=%s source=%s token_fp=%s",
+                username, source, fingerprint(token.plaintext),
             )
-            return None
-        self.limiter.record_success(source)
-        roles = self._roles_of(username) or frozenset()
-        token = self.sessions.issue(username, roles, now)
-        logger.info(
-            "login ok subject=%s source=%s token_fp=%s",
-            username, source, fingerprint(token.plaintext),
-        )
-        return token
+            return token
 
-    def refresh(self, plaintext: str, now: float) -> RefreshResult:
-        return self.sessions.refresh(plaintext, now)
+    def refresh(
+        self, plaintext: str, now: float, source: str = "unknown"
+    ) -> RefreshResult:
+        """凭证换发：来源准入 -> 原子轮换。
 
-    def logout(self, plaintext: str) -> bool:
-        return self.sessions.revoke(plaintext)
+        锁定期内直接拒绝，且先于任何凭证检查：不产生新凭证、旧凭证状态不变。
+        凭证原因（过期/已撤销/未知）与疑似被盗重放计入来源失败计数；
+        宽限窗口内的并发竞争重放不计入。
+        """
+        with self.limiter.gate(source, now) as held:
+            if not held.admitted:
+                logger.warning(
+                    "refresh rejected reason=rate_limited source=%s", source
+                )
+                return RefreshResult(ok=False, reason=RejectReason.RATE_LIMITED)
+            result = self.sessions.refresh(plaintext, now)
+            if result.ok:
+                held.report_success()
+            elif (
+                result.reason == RejectReason.REPLAYED
+                and result.replay_mode == "racing"
+            ):
+                # 并发竞争的重复使用是良性时序，不记为来源风险
+                logger.info(
+                    "refresh racing not counted source=%s token_fp=%s",
+                    source, fingerprint(plaintext),
+                )
+            else:
+                held.report_failure(now)
+                logger.warning(
+                    "refresh failure counted source=%s reason=%s",
+                    source, result.reason.value if result.reason else "unknown",
+                )
+            return result
+
+    def logout(
+        self,
+        plaintext: str,
+        source: str = "unknown",
+        now: float | None = None,
+    ) -> LogoutResult:
+        """凭证注销：来源准入 -> 撤销。锁定期内拒绝且不改动凭证状态。
+
+        成功撤销返回 changed=True；对已撤销凭证重复注销幂等（不计风险）；
+        未知凭证视为攻击尝试，计入来源失败。
+        """
+        if now is None:
+            now = time.time()
+        with self.limiter.gate(source, now) as held:
+            if not held.admitted:
+                logger.warning(
+                    "logout rejected reason=rate_limited source=%s", source
+                )
+                return LogoutResult(ok=False, reason=RejectReason.RATE_LIMITED)
+            changed = self.sessions.revoke(plaintext)
+            if changed:
+                held.report_success()
+                logger.info(
+                    "logout ok source=%s token_fp=%s", source, fingerprint(plaintext)
+                )
+                return LogoutResult(ok=True, changed=True)
+            reason = self.sessions.classify(plaintext, now)
+            if reason == RejectReason.UNKNOWN:
+                held.report_failure(now)
+            logger.warning(
+                "logout rejected reason=%s source=%s token_fp=%s",
+                reason.value if reason else "unknown", source, fingerprint(plaintext),
+            )
+            return LogoutResult(ok=False, changed=False, reason=reason)
+
+    # ---- 权限判定（非敏感写操作，不走来源准入） ----
 
     def authorize(self, plaintext: str, required: str, now: float) -> AuthzDecision:
         """权限判定：凭证无效或权限不足均拒绝，结论含命中依据。

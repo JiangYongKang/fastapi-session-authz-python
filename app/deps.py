@@ -15,6 +15,10 @@ def _settings_from_env() -> Settings:
         session_ttl_seconds=float(os.getenv("SESSION_TTL_SECONDS", "3600")),
         max_failed_attempts=int(os.getenv("MAX_FAILED_ATTEMPTS", "5")),
         lockout_seconds=float(os.getenv("LOCKOUT_SECONDS", "300")),
+        lockout_multiplier=float(os.getenv("LOCKOUT_MULTIPLIER", "2")),
+        max_lockout_seconds=float(os.getenv("MAX_LOCKOUT_SECONDS", "3600")),
+        calm_seconds=float(os.getenv("CALM_SECONDS", "86400")),
+        max_tracked_sources=int(os.getenv("MAX_TRACKED_SOURCES", "10000")),
         replay_grace_seconds=float(os.getenv("REPLAY_GRACE_SECONDS", "1")),
     )
 

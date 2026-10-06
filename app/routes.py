@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.deps import get_service, now, require
+from app.models import RejectReason
 from app.service import AuthService
 
 router = APIRouter()
@@ -37,10 +38,17 @@ def login(
 
 
 @router.post("/refresh")
-def refresh(body: TokenBody, svc: AuthService = Depends(get_service)):
-    result = svc.refresh(body.token, now())
+def refresh(
+    body: TokenBody,
+    request: Request,
+    svc: AuthService = Depends(get_service),
+):
+    result = svc.refresh(body.token, now(), source=_source(request))
     if not result.ok or result.token is None:
-        # 拒绝原因可区分：expired / revoked / replayed / unknown
+        # 来源锁定：429，响应体不涉及凭证有效性
+        if result.reason == RejectReason.RATE_LIMITED:
+            raise HTTPException(status_code=429, detail="too many requests")
+        # 凭证拒绝原因可区分：expired / revoked / replayed / unknown
         raise HTTPException(status_code=401, detail=result.reason.value)
     return {
         "token": result.token.plaintext,
@@ -49,9 +57,15 @@ def refresh(body: TokenBody, svc: AuthService = Depends(get_service)):
 
 
 @router.post("/logout", status_code=204)
-def logout(body: TokenBody, svc: AuthService = Depends(get_service)):
-    svc.logout(body.token)
-    return None
+def logout(
+    body: TokenBody,
+    request: Request,
+    svc: AuthService = Depends(get_service),
+):
+    result = svc.logout(body.token, source=_source(request), now=now())
+    # 来源锁定：429，且凭证状态未被改动
+    if result.reason == RejectReason.RATE_LIMITED:
+        raise HTTPException(status_code=429, detail="too many requests")
 
 
 @router.get("/protected/documents")

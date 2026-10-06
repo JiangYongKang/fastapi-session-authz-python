@@ -123,15 +123,23 @@ class SessionStore:
                     logger.warning(
                         "refresh rejected reason=replayed token_fp=%s mode=racing", fp
                     )
-                else:
-                    # 窗口之外：旧凭证事后被重放，疑似被盗，撤销整条链
-                    revoked = self._revoke_family_locked(record.family_id)
-                    logger.warning(
-                        "refresh rejected reason=replayed token_fp=%s "
-                        "mode=stolen family_revoked=%d",
-                        fp, revoked,
+                    return RefreshResult(
+                        ok=False,
+                        reason=RejectReason.REPLAYED,
+                        replay_mode="racing",
                     )
-                return RefreshResult(ok=False, reason=RejectReason.REPLAYED)
+                # 窗口之外：旧凭证事后被重放，疑似被盗，撤销整条链
+                revoked = self._revoke_family_locked(record.family_id)
+                logger.warning(
+                    "refresh rejected reason=replayed token_fp=%s "
+                    "mode=stolen family_revoked=%d",
+                    fp, revoked,
+                )
+                return RefreshResult(
+                    ok=False,
+                    reason=RejectReason.REPLAYED,
+                    replay_mode="stolen",
+                )
             if record.expires_at <= now:
                 logger.warning("refresh rejected reason=expired token_fp=%s", fp)
                 return RefreshResult(ok=False, reason=RejectReason.EXPIRED)

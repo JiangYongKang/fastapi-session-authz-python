@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 class RejectReason(enum.Enum):
@@ -12,6 +12,7 @@ class RejectReason(enum.Enum):
     REVOKED = "revoked"
     REPLAYED = "replayed"
     UNKNOWN = "unknown"
+    RATE_LIMITED = "rate_limited"  # 来源风险准入拒绝（与凭证原因可区分）
 
 
 class SessionStatus(enum.Enum):
@@ -46,6 +47,17 @@ class IssuedToken:
 class RefreshResult:
     ok: bool
     token: IssuedToken | None = None
+    reason: RejectReason | None = None
+    # 重放模式：racing=并发竞争（不计风险），stolen=疑似被盗（计一次失败）
+    replay_mode: str | None = None
+
+
+@dataclass(frozen=True)
+class LogoutResult:
+    """注销结论：ok 表示本次真的撤销了一张有效凭证；限流拒绝时给出原因。"""
+
+    ok: bool
+    changed: bool = False
     reason: RejectReason | None = None
 
 

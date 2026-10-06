@@ -29,6 +29,10 @@ def settings() -> Settings:
         session_ttl_seconds=100.0,
         max_failed_attempts=3,
         lockout_seconds=30.0,
+        lockout_multiplier=2.0,
+        max_lockout_seconds=120.0,
+        calm_seconds=20.0,
+        max_tracked_sources=100,
         replay_grace_seconds=1.0,
     )
 

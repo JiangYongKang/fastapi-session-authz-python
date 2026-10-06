@@ -49,25 +49,67 @@ uv run pytest                      # 运行全部测试（日志随测试输出 
   `replayed`（被重放），另有 `unknown`（未知凭证）。撤销与过期同时成立时
   稳定归为 `revoked`。
 
-## 3. 限流与锁定
+## 3. 统一来源风险准入（限流与渐进式锁定）
 
-- 按来源（请求端 IP）统计**连续**登录失败；达到 `MAX_FAILED_ATTEMPTS`
-  （默认 5）次后锁定该来源 `LOCKOUT_SECONDS`（默认 300）秒。
-- 锁定期内所有登录一律拒绝，**即使口令正确**；锁定期满后自动解除并重新计数。
-- 一次登录成功立即清零失败计数。
-- 计数变更全部在同一把锁内完成：并发失败请求精确计入（不漏计、不重复计）。
-- **信息不泄露**：用户不存在、口令错误、来源锁定对外均返回相同的
+登录、**凭证换发（refresh）**、**凭证注销（logout）** 属于同一类敏感操作，
+统一经过来源风险准入（`RateLimiter.gate(source)`），同一来源（请求端 IP）
+共享**同一份失败计数、锁定状态与升级等级**。
+
+### 3.1 准入范围与结论区分
+
+- 每次敏感操作先做来源准入，再触碰任何凭证状态：来源处于锁定期内时，
+  换发/注销**直接拒绝**——不会产生新凭证，也不会把旧凭证置为
+  ROTATED/REVOKED。
+- 准入通过后：登录口令错误、换发命中 `expired/revoked/unknown` 或
+  **宽限窗口外疑似被盗的重放（stolen）**、注销遇到未知凭证，均计入该来源
+  一次失败；换发在宽限窗口内的**并发竞争重放（racing）**视为良性时序、
+  不计风险；对已撤销凭证重复注销幂等、不计风险。敏感操作成功即清零当前
+  失败计数。
+- 调用方可区分两类拒绝：限流拒绝为 `RejectReason.RATE_LIMITED`
+  （HTTP 层换发/注销返回 **429** `{"detail":"too many requests"}`），
+  凭证拒绝仍为 `expired/revoked/replayed/unknown`（HTTP 401）。
+- **信息不泄露**：锁定期间的换发/注销不读取、不判定凭证，响应体与是否
+  存在有效凭证无关；登录锁定、用户不存在、口令错误对外仍是**相同**的
   `401 {"detail":"invalid credentials"}`；用户不存在时也执行一次假盐
-  PBKDF2 以拉平耗时；响应与日志中不出现明文口令或凭证，日志仅记录来源、
-  主体与凭证指纹。
+  PBKDF2 拉平耗时；响应与日志中不出现明文口令或凭证，日志仅记录来源、
+  主体、操作与凭证指纹（限流拒绝行不带凭证指纹）。
+
+### 3.2 渐进式锁定与平稳恢复
+
+- 同一来源连续失败达到 `MAX_FAILED_ATTEMPTS`（默认 5）次触发一次锁定；
+  **连续多次触发锁定时，每次时长比上一次更长**：
+  `LOCKOUT_SECONDS × LOCKOUT_MULTIPLIER^level`，直到
+  `MAX_LOCKOUT_SECONDS` 封顶（默认 300s 基础、2 倍递增、3600s 封顶）。
+- 锁定期内的请求一律拒绝、**不计数也不续期**；锁定期满自动解除并清零
+  失败计数，恢复后的第一次正常操作照常成功。
+- **平稳恢复**：从最近一次锁定期满起，连续 `CALM_SECONDS`（默认 86400s）
+  没有新的失败触发，升级等级回到基础档（level=0）重新计数；平稳期内
+  再次触发锁定则在当前等级上继续递增。
+- 同一来源的敏感操作由固定 **64 道条带锁**（来源经 crc32 稳定映射）串行化，
+  “准入判定 → 失败计入 → 凭证变更”处于同一串行区间，锁序恒为
+  条带锁→内部锁：锁定期内不会放行、刚清零的计数不会被旧请求写回、
+  锁定期不会被反复续上。
+
+### 3.3 有界的状态管理
+
+- 风险状态表最多保留 `MAX_TRACKED_SOURCES`（默认 10000）个来源，内存不随
+  请求量无限增长；从未失败过的正常操作不留任何状态。
+- **闲置回收**：计数为零、未锁定、且升级等级已过平稳期的来源，在后续
+  准入/失败登记时按**来源键排序后确定性删除**（结果可复现）；区间结束后
+  的空占位立即移除；成功归零且已过平稳期的来源立即移除。
+- 仍在锁定期内的来源、正在累计失败序列的来源、以及升级等级仍在平稳窗口内
+  的来源**绝不会被提前回收/放行/清零**；正处于准入区间的来源以
+  `in_gate` 标记保护。
+- 容量打满且无闲置可回收时（即所有在表来源都仍有风险），新失败被保安全
+  丢弃并告警，状态表严格不超上限。
 
 ## 4. 接口
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/login` | 体 `{username,password}`；成功返回 `{token,expires_at}`，失败统一 401 |
-| POST | `/refresh` | 体 `{token}`；成功返回新凭证，失败 401 且 detail 为 expired/revoked/replayed/unknown |
-| POST | `/logout` | 体 `{token}`；撤销凭证，204 |
+| POST | `/login` | 体 `{username,password}`；成功返回 `{token,expires_at}`，失败统一 401（锁定不单独暴露） |
+| POST | `/refresh` | 体 `{token}`；成功返回新凭证；凭证原因 401（expired/revoked/replayed/unknown），来源锁定 429 |
+| POST | `/logout` | 体 `{token}`；撤销凭证，204；来源锁定 429（凭证不变）；重复注销幂等 |
 | GET  | `/protected/documents` | 需 `documents:read`（Bearer 令牌） |
 | POST | `/protected/documents` | 需 `documents:write` |
 
@@ -78,21 +120,47 @@ uv run pytest                      # 运行全部测试（日志随测试输出 
 | 环境变量 | 默认值 | 含义 |
 | --- | --- | --- |
 | `SESSION_TTL_SECONDS` | `3600` | 会话凭证有效期（秒） |
-| `MAX_FAILED_ATTEMPTS` | `5` | 触发锁定的连续失败次数 |
-| `LOCKOUT_SECONDS` | `300` | 锁定时长（秒） |
+| `MAX_FAILED_ATTEMPTS` | `5` | 触发锁定的连续失败次数（登录/换发/注销共享） |
+| `LOCKOUT_SECONDS` | `300` | 基础锁定时长（秒，第 1 档） |
+| `LOCKOUT_MULTIPLIER` | `2` | 每升一档锁定时长的递增倍数 |
+| `MAX_LOCKOUT_SECONDS` | `3600` | 单次锁定时长上限（秒），递增到此封顶 |
+| `CALM_SECONDS` | `86400` | 平稳期（秒）：距最近一次锁定期满无新失败后，等级回基础档 |
+| `MAX_TRACKED_SOURCES` | `10000` | 风险状态表保留的来源数量上限 |
 | `REPLAY_GRACE_SECONDS` | `1` | 轮换后区分并发竞争与事后重放的宽限窗口（秒） |
 
-## 6. 代码结构
+## 6. 兼容性与本地验证
+
+**兼容范围**：登录、轮换、撤销、层级权限判定与并发刷新的既有行为保持不变；
+登录锁定仍对外返回统一 401。本次增量为：换发/注销新增来源准入（锁定期
+返回 429）；`RejectReason` 新增 `rate_limited`；服务层 `refresh/logout`
+新增 `source`（注销默认 `unknown`），注销返回值由 `bool` 升级为
+`LogoutResult{ok,changed,reason}`。
+
+```bash
+uv sync
+uv run pytest                      # 全部单测（AUDIT 审计行随日志输出）
+uv run pytest tests/test_risk_gate.py                  # 仅新增风控用例
+LOCKOUT_SECONDS=60 LOCKOUT_MULTIPLIER=3 \
+  MAX_LOCKOUT_SECONDS=1800 CALM_SECONDS=3600 \
+  MAX_TRACKED_SOURCES=5000 uv run uvicorn main:app     # 自定义锁定策略启动
+```
+
+测试日志中的每个用例以
+`AUDIT action=... | input=... | basis=... | conclusion=...` 展示请求输入、
+命中的判定依据与最终结论；另有自动校验确保任何日志行都不出现明文凭证或
+口令（见 `tests/conftest.py`）。
+
+## 7. 代码结构
 
 ```
-app/models.py        数据模型与拒绝原因枚举
-app/config.py        配置项
+app/models.py        数据模型与拒绝原因枚举（含 rate_limited、LogoutResult）
+app/config.py        配置项（阈值/基础时长/倍数/上限/平稳期/容量）
 app/tokens.py        凭证生成 / 哈希 / 指纹
-app/session_store.py 凭证存储：签发、轮换（加锁原子）、撤销、原因分类
+app/session_store.py 凭证存储：签发、轮换（加锁原子）、撤销、原因分类、重放模式
 app/authz.py         角色注册表、层级/通配覆盖判定、可解释结论
-app/rate_limit.py    失败计数与来源锁定
-app/service.py       用例组合层：登录、刷新、登出、授权
+app/rate_limit.py    统一来源风险准入、渐进式锁定/平稳恢复、有界状态回收
+app/service.py       用例组合层：登录/换发/注销经 gate，授权实时判定
 app/deps.py          FastAPI 依赖与服务单例
-app/routes.py        HTTP 接口
-tests/               生命周期/并发、权限、限流锁定、HTTP 集成测试
+app/routes.py        HTTP 接口（锁定 429 / 凭证原因 401 / 登录统一 401）
+tests/               生命周期/并发、权限、限流锁定、风险准入、HTTP 集成测试
 ```

@@ -28,13 +28,13 @@ def test_expired_rejected_as_expired(svc):
 
 def test_revoked_rejected_as_revoked(svc):
     token = svc.sessions.issue("alice", frozenset(), now=0.0)
-    assert svc.logout(token.plaintext) is True
+    assert svc.logout(token.plaintext).changed is True
     audit("logout", "revoke token", "status=revoked", "revoked")
     assert svc.sessions.classify(token.plaintext, now=10.0) == RejectReason.REVOKED
     result = svc.refresh(token.plaintext, now=10.0)
     assert result.reason == RejectReason.REVOKED
     # 重复撤销幂等，原因保持“已撤销”
-    assert svc.logout(token.plaintext) is False
+    assert svc.logout(token.plaintext).changed is False
     assert svc.sessions.classify(token.plaintext, now=10.0) == RejectReason.REVOKED
 
 
@@ -88,7 +88,7 @@ def test_concurrent_refresh_only_one_wins(svc, caplog):
     assert svc.sessions.validate(winner_token, now=1.5) is not None
     audit("refresh x8 concurrent", "same old token, barrier sync",
           "lock-serialized check+rotate",
-          f"1 rotated + 7 replayed; winner_valid=True")
+          "1 rotated + 7 replayed; winner_valid=True")
     # 日志不得包含明文凭证
     for record in caplog.records:
         assert token.plaintext not in record.getMessage()

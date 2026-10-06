@@ -116,3 +116,41 @@ def test_lockout_boundary_over_http(svc):
         assert r.json() == {"detail": "invalid credentials"}
         audit("POST /login", "correct password during lock", "source locked",
               "401 generic")
+
+
+def test_sensitive_ops_rate_limited_over_http(svc):
+    """锁定期内换发/注销返回 429，且响应不区分凭证是否有效、不改动凭证。"""
+    with _client(svc) as c:
+        # 先正常登录拿到一张有效凭证
+        token = c.post(
+            "/login", json={"username": "alice", "password": "alice-secret"}
+        ).json()["token"]
+        # 同一来源（测试客户端）连续登录失败触发锁定
+        for _ in range(3):
+            assert c.post(
+                "/login", json={"username": "alice", "password": "bad"}
+            ).status_code == 401
+        audit("POST /login x3", "testclient source", "threshold reached", "locked")
+
+        # 有效凭证换发：429（而非 200/401），且之后锁解除后凭证仍可用
+        r1 = c.post("/refresh", json={"token": token})
+        assert r1.status_code == 429
+        assert r1.json() == {"detail": "too many requests"}
+        audit("POST /refresh", "valid token while locked",
+              "gate before credential logic", "429 rate_limited")
+        r1b = c.post("/refresh", json={"token": "totally-made-up"})
+        assert r1b.status_code == 429 and r1b.json() == r1.json()
+        audit("POST /refresh", "unknown token while locked",
+              "identical 429, validity not disclosed", "429 generic")
+
+        # 有效凭证注销：429，且凭证未被撤销
+        r2 = c.post("/logout", json={"token": token})
+        assert r2.status_code == 429
+        audit("POST /logout", "valid token while locked",
+              "gate before revoke", "429; token untouched")
+
+    # 锁定期满（30s）后，同一凭证仍 ACTIVE，可正常换发
+    result = svc.refresh(token, now=100.0, source="127.0.0.1")
+    assert result.ok and result.token is not None
+    audit("POST /refresh after expiry", "untouched token still active",
+          "gate admitted", "200 rotated")
